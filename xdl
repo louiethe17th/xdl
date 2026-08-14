@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# xdl — download the video / image / GIF from an X (Twitter) post URL.
+#
+#   xdl https://x.com/user/status/123456789
+#   xdl -o ~/Pictures https://x.com/user/status/123
+#   xdl -c firefox https://x.com/user/status/123     # use browser cookies (age-gated / protected posts)
+#
+# Saves to ~/Downloads/x-media by default as: <username>-<tweet_id>-<n>.<ext>
+
+set -uo pipefail
+
+VENV="$HOME/.local/share/xdl-venv"
+GDL="$VENV/bin/gallery-dl"
+YTDLP="$VENV/bin/yt-dlp"
+
+OUTDIR="${XDL_DIR:-$HOME/Downloads/x-media}"
+COOKIES="${XDL_COOKIES:-}"
+OPEN_DIR=0
+
+die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+
+usage() {
+    sed -n '2,9p' "$0" | sed 's/^# \?//'
+    cat <<'EOF'
+
+Options:
+  -o DIR      output directory (default ~/Downloads/x-media, or $XDL_DIR)
+  -c BROWSER  load cookies from browser: firefox, chrome, chromium, brave, edge
+  -O          open the output directory when done
+  -u          update yt-dlp / gallery-dl, then exit
+  -h          show this help
+EOF
+    exit 0
+}
+
+while getopts ":o:c:Ouh" opt; do
+    case "$opt" in
+        o) OUTDIR="$OPTARG" ;;
+        c) COOKIES="$OPTARG" ;;
+        O) OPEN_DIR=1 ;;
+        u) info "updating…"; "$VENV/bin/pip" install --quiet --upgrade yt-dlp gallery-dl \
+               && info "done: yt-dlp $("$YTDLP" --version), gallery-dl $("$GDL" --version)"; exit $? ;;
+        h) usage ;;
+        \?) die "unknown option -$OPTARG (try -h)" ;;
+        :) die "option -$OPTARG needs an argument" ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[[ -x "$GDL" && -x "$YTDLP" ]] || die "toolchain missing at $VENV — recreate with:
+  python3 -m venv $VENV && $VENV/bin/pip install yt-dlp gallery-dl"
+
+[[ $# -ge 1 ]] || usage
+
+# --- normalise the URL ------------------------------------------------------
+# Accepts x.com, twitter.com, mobile.*, and the fx/vx/fixup mirror domains.
+normalize() {
+    local u="$1"
+    [[ "$u" == http* ]] || u="https://$u"
+    u="${u%%\?*}"                                    # strip tracking query (?s=20&t=…)
+    u="$(sed -E 's#https?://([a-z0-9]+\.)?(x|twitter|fxtwitter|vxtwitter|fixupx|twittpr)\.com#https://x.com#i' <<<"$u")"
+    u="$(sed -E 's#/(photo|video)/[0-9]+/?$##' <<<"$u")"   # drop /photo/1 suffix so we get all media
+    printf '%s' "$u"
+}
+
+mkdir -p "$OUTDIR" || die "cannot create $OUTDIR"
+
+status=0
+for raw in "$@"; do
+    url="$(normalize "$raw")"
+
+    if ! [[ "$url" =~ ^https://x\.com/[^/]+/status/[0-9]+ ]]; then
+        printf '\033[33mskip:\033[0m not an X post URL: %s\n' "$raw" >&2
+        status=1
+        continue
+    fi
+
+    info "$url"
+
+    gdl_args=(
+        --dest "$OUTDIR"
+        --filename '{user[name]}-{tweet_id}-{num}.{extension}'
+        --no-part
+        --retries 3
+    )
+    ytdlp_args=(
+        --paths "$OUTDIR"
+        --output '%(uploader_id)s-%(id)s.%(ext)s'
+        --no-part
+        --retries 3
+        --merge-output-format mp4
+    )
+    if [[ -n "$COOKIES" ]]; then
+        gdl_args+=(--cookies-from-browser "$COOKIES")
+        ytdlp_args+=(--cookies-from-browser "$COOKIES")
+    fi
+
+    before=$(find "$OUTDIR" -maxdepth 1 -type f | wc -l)
+
+    # gallery-dl is primary: it grabs every attachment in a post (images, video, GIF-as-mp4).
+    "$GDL" "${gdl_args[@]}" "$url"
+    rc=$?
+
+    after=$(find "$OUTDIR" -maxdepth 1 -type f | wc -l)
+
+    # Nothing landed? Fall back to yt-dlp, which sometimes gets video posts gallery-dl misses.
+    if (( after == before )); then
+        info "gallery-dl found nothing, trying yt-dlp…"
+        "$YTDLP" "${ytdlp_args[@]}" "$url"
+        rc=$?
+        after=$(find "$OUTDIR" -maxdepth 1 -type f | wc -l)
+    fi
+
+    n=$(( after - before ))
+    if (( n > 0 )); then
+        printf '\033[32m✓\033[0m saved %d file(s) to %s\n' "$n" "$OUTDIR"
+        find "$OUTDIR" -maxdepth 1 -type f -newermt '-1 minute' -printf '    %f\n' 2>/dev/null | sort
+    else
+        printf '\033[31m✗\033[0m no media downloaded (rc=%d)\n' "$rc" >&2
+        printf '  If the post is age-restricted, protected, or X wants a login, retry with:\n' >&2
+        printf '    xdl -c firefox %s\n' "$raw" >&2
+        status=1
+    fi
+done
+
+if (( OPEN_DIR )) && command -v xdg-open >/dev/null; then
+    xdg-open "$OUTDIR" >/dev/null 2>&1 &
+fi
+
+exit $status
