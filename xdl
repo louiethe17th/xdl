@@ -66,6 +66,10 @@ normalize() {
 
 mkdir -p "$OUTDIR" || die "cannot create $OUTDIR"
 
+snap_before=$(mktemp) || die "cannot create temp file"
+snap_after=$(mktemp) || die "cannot create temp file"
+trap 'rm -f "$snap_before" "$snap_after"' EXIT
+
 status=0
 for raw in "$@"; do
     url="$(normalize "$raw")"
@@ -79,7 +83,7 @@ for raw in "$@"; do
     info "$url"
 
     gdl_args=(
-        --dest "$OUTDIR"
+        --directory "$OUTDIR"   # -D, not -d: writes files flat instead of nesting them in twitter/<user>/
         --filename '{user[name]}-{tweet_id}-{num}.{extension}'
         --no-part
         --retries 3
@@ -96,26 +100,31 @@ for raw in "$@"; do
         ytdlp_args+=(--cookies-from-browser "$COOKIES")
     fi
 
-    before=$(find "$OUTDIR" -maxdepth 1 -type f | wc -l)
+    # Snapshot the tree rather than counting: downloaders preserve the server's
+    # Last-Modified, so an mtime test would miss files that just arrived.
+    find "$OUTDIR" -type f -printf '%P\n' 2>/dev/null | sort > "$snap_before"
+    before=$(wc -l < "$snap_before")
 
     # gallery-dl is primary: it grabs every attachment in a post (images, video, GIF-as-mp4).
     "$GDL" "${gdl_args[@]}" "$url"
     rc=$?
 
-    after=$(find "$OUTDIR" -maxdepth 1 -type f | wc -l)
+    find "$OUTDIR" -type f -printf '%P\n' 2>/dev/null | sort > "$snap_after"
+    after=$(wc -l < "$snap_after")
 
     # Nothing landed? Fall back to yt-dlp, which sometimes gets video posts gallery-dl misses.
     if (( after == before )); then
         info "gallery-dl found nothing, trying yt-dlp…"
         "$YTDLP" "${ytdlp_args[@]}" "$url"
         rc=$?
-        after=$(find "$OUTDIR" -maxdepth 1 -type f | wc -l)
+        find "$OUTDIR" -type f -printf '%P\n' 2>/dev/null | sort > "$snap_after"
+        after=$(wc -l < "$snap_after")
     fi
 
     n=$(( after - before ))
     if (( n > 0 )); then
         printf '\033[32m✓\033[0m saved %d file(s) to %s\n' "$n" "$OUTDIR"
-        find "$OUTDIR" -maxdepth 1 -type f -newermt '-1 minute' -printf '    %f\n' 2>/dev/null | sort
+        comm -13 "$snap_before" "$snap_after" | sed 's/^/    /'
     else
         printf '\033[31m✗\033[0m no media downloaded (rc=%d)\n' "$rc" >&2
         printf '  If the post is age-restricted, protected, or X wants a login, retry with:\n' >&2
